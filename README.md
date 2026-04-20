@@ -11,7 +11,8 @@ Fortran:
 - `td_real`: triple-double precision, about 159 mantissa bits
 - `qd_real`: quad-double precision, about 212 mantissa bits
 
-libQD3 1.0.0 was released on 2026-04-20.  This first release adds
+## News
+2026-04-20 libQD3 1.0.0 was released on 2026-04-20.  This first release adds
 TD/triple-double support through the new `td_real` type.  See
 [CHANGES.1.0.0.md](CHANGES.1.0.0.md) for the 1.0.0 release notes.
 
