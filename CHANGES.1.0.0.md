@@ -1,13 +1,73 @@
 # Changes for libQD3 1.0.0
 
-Commit range summarized:
+Commit range summarized from the qd-2.3.24 tarball baseline:
 
-- `98f6c05289382fdd1433c596f8854cdf026f19fe`
+- `a0a93cc7f0a946b56d5a4d4f96aacfda99b0ab2e`
 - through `HEAD`
 
 This release starts libQD3 as an independently versioned fork of QD and
 adds triple-double arithmetic as a first-class precision type alongside
 `dd_real` and `qd_real`.
+
+## Changes Inherited Since QD 2.3.24
+
+Before the libQD3 rename and triple-double work, this branch includes several
+post-2.3.24 fixes and test improvements for the original `dd_real` and
+`qd_real` code paths.
+
+### Huge-Operand Overflow Fixes
+
+- Fixed `dd_real` division and square root overflow for very large operands.
+  The affected operations now rescale extremely large values by exact powers
+  of two before quotient reconstruction or Karp-style square-root refinement,
+  then scale the result back afterward.
+- Fixed `qd_real` division overflow for very large operands in:
+  `operator/(const qd_real &, double)`,
+  `qd_real::sloppy_div(const qd_real &, const dd_real &)`,
+  `qd_real::accurate_div(const qd_real &, const dd_real &)`,
+  `qd_real::sloppy_div(const qd_real &, const qd_real &)`, and
+  `qd_real::accurate_div(const qd_real &, const qd_real &)`.
+- Fixed `qd_real` square root overflow for very large operands by rescaling
+  with the exact identity `sqrt(a) = 2 * sqrt(a / 4)` before Newton
+  refinement.
+- Preserved the normal-range algorithms; the rescaling paths are only used
+  for operands near the overflow boundary.
+
+### Large-Value Regression Tests
+
+- Added and expanded `tests/huge.cpp` coverage for `dd_real` and `qd_real`
+  division and square root near `DBL_MAX`.
+- Added regression checks for finite results, division by one, scaled
+  reconstruction, square-root behavior, overflow-neighborhood samples,
+  tail-preserving multiword inputs, large/large near-one quotients,
+  small-output division, negative division, and exact power-of-two oracle
+  cases.
+- Fixed fragile relative-error checks by computing the final relative error
+  in `double` when the expected value is near `DBL_MAX`.
+- Documented and skipped reconstruction checks that cannot pass because
+  `two_sum(DBL_MAX, correction)` can overflow inside DD/QD error accumulation.
+- Replaced unsafe expected-value construction such as `maxv * 0.5` with
+  `mul_pwr2(maxv, 0.5)` and related exact power-of-two scaling.
+- Relaxed the huge-number formatting test so it validates scientific exponent,
+  significant-digit count, and parser round-trip instead of depending on an
+  unstable exact decimal mantissa.
+
+### Configure and FMA Policy
+
+- Made implicit floating-point contraction control a hard configure-time
+  requirement, because DD/QD error-free transforms are unsafe when the compiler
+  silently contracts arithmetic.
+- Configure now probes for a supported contraction-suppression flag, preferring
+  `-fp-model strict` and then `-ffp-contract=off`, and fails if neither works.
+- Extended `--enable-fma=auto` so non-listed architectures such as aarch64 and
+  riscv64 can probe GNU/C99 FMA APIs instead of silently disabling FMA.
+- Kept `--enable-fma` as an FMA API-selection option only; it no longer implies
+  `-march` or `-mfma`.
+- Added `--with-arch=generic|x86-64-v3|native` for explicit ISA selection, with
+  configure checks for compiler support and a cross-compilation guard against
+  `--with-arch=native`.
+- Configure reports the selected FMA macros, contraction-control flag, and
+  architecture setting.
 
 ## Project Rename and Versioning
 
@@ -93,6 +153,11 @@ adds triple-double arithmetic as a first-class precision type alongside
 - Updated TD division documentation to match the implemented long-division
   design and cost model.
 - Added 2-clause BSD headers to newly introduced triple-double source files.
+- Updated `README.md` for libQD3, explicitly documenting that libQD3 is a fork
+  of QD, summarizing the `dd_real`, `td_real`, and `qd_real` types, and linking
+  to these 1.0.0 release notes.
+- Added the 2026-04-20 libQD3 1.0.0 release note and TD support summary to
+  `README.md`.
 
 ## Tests and QA
 
@@ -123,4 +188,3 @@ adds triple-double arithmetic as a first-class precision type alongside
 - Fixed a loop counter type and cleaned up misleading local variable names in
   tests.
 - Stripped trailing whitespace in touched test code.
-
