@@ -227,6 +227,57 @@ AC_SUBST([ARCH_CXXFLAGS], [$arch_cxxflags])
 # Checks for header files.
 AC_CHECK_HEADERS([ieeefp.h])
 
+# Probe GNU C++ _Float64x binary80 support for edd_real.
+AC_MSG_CHECKING([for GNU C++ _Float64x binary80 support for edd_real])
+enable_edd_real="no"
+edd_real_status="disabled"
+edd_float64x_mant_dig="n/a"
+edd_float64x_max_exp="n/a"
+edd_splitter="n/a"
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[
+     #ifndef __GNUC__
+     #error edd_real requires GNU C++
+     #endif
+     #if !defined(__x86_64__) && !defined(__i386__)
+     #error edd_real Phase 1 only supports x86 GNU _Float64x binary80 targets
+     #endif
+     #ifndef __FLT64X_MANT_DIG__
+     #error missing __FLT64X_MANT_DIG__
+     #endif
+     #ifndef __FLT64X_MAX_EXP__
+     #error missing __FLT64X_MAX_EXP__
+     #endif
+     #if __FLT64X_MANT_DIG__ != 64
+     #error edd_real Phase 1 requires binary80 _Float64x with 64-bit mantissa
+     #endif
+     static_assert(__FLT64X_MANT_DIG__ == 64, "binary80 _Float64x required");
+   ]], [[
+     _Float64x x = (_Float64x) 1.0;
+     _Float64x y = __builtin_sqrtf64x(x);
+     _Float64x z = __builtin_ldexpf64x(y, 32);
+     int cls = __builtin_isfinite(z);
+     return cls ? 0 : 1;
+   ]])],
+  [enable_edd_real="yes"
+   edd_real_status="enabled"
+   edd_float64x_mant_dig="64"
+   edd_float64x_max_exp="16384"
+   edd_splitter="2^32 + 1"
+   AC_DEFINE([QD_HAVE_EDD_REAL], [1],
+     [Define to 1 if edd_real is enabled for GNU C++ _Float64x binary80 targets.])
+   AC_DEFINE([QD_EDD_FLT64X_MANT_DIG], [64],
+     [Mantissa precision in bits for the _Float64x edd_real limb type.])
+   AC_DEFINE([QD_EDD_FLT64X_MAX_EXP], [16384],
+     [Maximum exponent macro value for the supported binary80 _Float64x target.])
+   AC_DEFINE([QD_EDD_SPLIT_BITS], [32],
+     [Splitter exponent ceil(p/2) used by edd_real for binary80 _Float64x limbs.])
+   AC_DEFINE([QD_EDD_SPLIT_SCALE_BITS], [33],
+     [Scaling exponent used to avoid overflow in edd_real limb splitting.])],
+  [AC_MSG_WARN([edd_real disabled: GNU C++ _Float64x binary80 support was not detected.])])
+AC_MSG_RESULT([$edd_real_status])
+AM_CONDITIONAL(HAVE_EDD_REAL, [test "$enable_edd_real" = "yes"])
+
 CONFIGURE_ARGS=$ac_configure_args
 AC_SUBST(CONFIGURE_ARGS)
 
@@ -361,4 +412,7 @@ echo "  fma               = $ax_cxx_fma"
 echo "  fms               = $ax_cxx_fms"
 echo "  fma cxxflags      = $fma_added_cxxflags"
 echo "  arch              = $with_arch ($arch_cxxflags)"
-
+echo "  edd_real          = $edd_real_status"
+echo "  _Float64x mantdig = $edd_float64x_mant_dig"
+echo "  _Float64x max exp = $edd_float64x_max_exp"
+echo "  edd splitter      = $edd_splitter"

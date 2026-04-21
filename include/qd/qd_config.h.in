@@ -68,6 +68,31 @@
 #undef QD_SLOPPY_DIV
 #endif
 
+/* Define to 1 if edd_real is enabled for GNU C++ _Float64x binary80 targets. */
+#ifndef QD_HAVE_EDD_REAL
+#undef QD_HAVE_EDD_REAL
+#endif
+
+/* Mantissa precision in bits for the _Float64x edd_real limb type. */
+#ifndef QD_EDD_FLT64X_MANT_DIG
+#undef QD_EDD_FLT64X_MANT_DIG
+#endif
+
+/* Maximum exponent macro value for the supported binary80 _Float64x target. */
+#ifndef QD_EDD_FLT64X_MAX_EXP
+#undef QD_EDD_FLT64X_MAX_EXP
+#endif
+
+/* Splitter exponent ceil(p/2) used by edd_real for binary80 _Float64x limbs. */
+#ifndef QD_EDD_SPLIT_BITS
+#undef QD_EDD_SPLIT_BITS
+#endif
+
+/* Scaling exponent used to avoid overflow in edd_real limb splitting. */
+#ifndef QD_EDD_SPLIT_SCALE_BITS
+#undef QD_EDD_SPLIT_SCALE_BITS
+#endif
+
 /* Define this macro to be the isfinite(x) function. */
 #ifndef QD_ISFINITE
 #undef QD_ISFINITE

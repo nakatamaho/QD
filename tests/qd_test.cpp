@@ -21,6 +21,9 @@
 #include <vector>
 #include <qd/qd_real.h>
 #include <qd/td_real.h>
+#ifdef QD_HAVE_EDD_REAL
+#include <qd/edd_real.h>
+#endif
 #include <qd/inline.h>
 #include <qd/fpu.h>
 
@@ -37,6 +40,9 @@ using std::exit;
 static bool flag_test_dd = false;
 static bool flag_test_td = false;
 static bool flag_test_qd = false;
+#ifdef QD_HAVE_EDD_REAL
+static bool flag_test_edd = false;
+#endif
 bool flag_verbose = false;
 
 bool print_result(bool result) {
@@ -89,6 +95,231 @@ td_real polyroot(const td_real *c, int n, const td_real &x0,
 }
 
 namespace {
+
+#ifdef QD_HAVE_EDD_REAL
+
+qd_real edd_to_qd(const edd_real &a) {
+  std::string s = a.to_string(40, 0, std::ios_base::scientific);
+  return qd_real(s.c_str());
+}
+
+bool edd_nonoverlap(_Float64x hi, _Float64x lo) {
+  if (hi == (_Float64x) 0.0) {
+    return lo == (_Float64x) 0.0;
+  }
+  return __builtin_fabsf64x(lo) <=
+      (_Float64x) 0.5 * __builtin_ldexpf64x(__builtin_fabsf64x(hi), -63);
+}
+
+bool edd_is_normalized(const edd_real &a) {
+  return __builtin_fabsf64x(a[0]) >= __builtin_fabsf64x(a[1]) &&
+         edd_nonoverlap(a[0], a[1]);
+}
+
+double edd_abs_error(const edd_real &a, const qd_real &ref) {
+  return to_double(abs(edd_to_qd(a) - ref));
+}
+
+double edd_scale(const qd_real &ref) {
+  return std::max(1.0, std::abs(to_double(ref)));
+}
+
+bool edd_check_close(const edd_real &a, const qd_real &ref, double factor) {
+  return edd_abs_error(a, ref) <= factor * static_cast<double>(edd_real::_eps) *
+      edd_scale(ref);
+}
+
+class EddTestSuite {
+public:
+  bool test1();
+  bool test2();
+  bool test3();
+  bool test4();
+  bool test5();
+  bool test6();
+  bool test7();
+  bool test8();
+  bool test9();
+  bool testall();
+};
+
+bool EddTestSuite::test1() {
+  cout << endl;
+  cout << "Test 1.  (edd normalization invariants after arithmetic)." << endl;
+
+  edd_real a("1.23456789012345678901234567890123456789");
+  edd_real b("9.87654321098765432109876543210987654321e-30");
+  edd_real c("-8.76543210987654321098765432109876543210e40");
+
+  edd_real sum = a + c;
+  edd_real diff = a - b;
+  edd_real prod = a * c;
+  edd_real quot = c / a;
+  edd_real root = sqrt(edd_real("2.0"));
+
+  return edd_is_normalized(sum) && edd_is_normalized(diff) &&
+      edd_is_normalized(prod) && edd_is_normalized(quot) &&
+      edd_is_normalized(root);
+}
+
+bool EddTestSuite::test2() {
+  cout << endl;
+  cout << "Test 2.  (edd cancellation-sensitive addition / subtraction)." << endl;
+
+  const char *sa = "1.00000000000000011102230246251565404236316680908203125";
+  const char *sb = "1.000000000000000055511151231257827021181583404541015625";
+  edd_real a(sa);
+  edd_real b(sb);
+  edd_real diff = a - b;
+  edd_real back = diff + b;
+  qd_real qdiff = qd_real(sa) - qd_real(sb);
+  qd_real qback = qdiff + qd_real(sb);
+
+  return edd_check_close(diff, qdiff, 32.0) &&
+      edd_check_close(back, qback, 32.0);
+}
+
+bool EddTestSuite::test3() {
+  cout << endl;
+  cout << "Test 3.  (edd mixed-magnitude multiplication)." << endl;
+
+  const char *sa = "1.23456789012345678901234567890123456789e30";
+  const char *sb = "9.87654321098765432109876543210987654321e-20";
+  edd_real a(sa);
+  edd_real b(sb);
+  edd_real prod = a * b;
+  qd_real qprod = qd_real(sa) * qd_real(sb);
+
+  return edd_check_close(prod, qprod, 48.0);
+}
+
+bool EddTestSuite::test4() {
+  cout << endl;
+  cout << "Test 4.  (edd basic division sanity checks)." << endl;
+
+  const char *sa = "1.23456789012345678901234567890123456789e40";
+  const char *sb = "9.87654321098765432109876543210987654321e10";
+  edd_real a(sa);
+  edd_real b(sb);
+  edd_real q = a / b;
+  edd_real thirds = edd_real("1.0") / edd_real("3.0");
+  qd_real qq = qd_real(sa) / qd_real(sb);
+  qd_real qthirds = qd_real(1.0) / qd_real(3.0);
+
+  return edd_check_close(q, qq, 64.0) &&
+      edd_check_close(thirds, qthirds, 64.0) &&
+      edd_check_close(q * b, qd_real(sa), 128.0);
+}
+
+bool EddTestSuite::test5() {
+  cout << endl;
+  cout << "Test 5.  (edd sqrt on exact squares)." << endl;
+
+  edd_real square("15241578750190521");
+  edd_real exact = sqrt(square);
+  qd_real qexact("123456789");
+
+  return edd_check_close(exact, qexact, 32.0);
+}
+
+bool EddTestSuite::test6() {
+  cout << endl;
+  cout << "Test 6.  (edd sqrt near 1)." << endl;
+
+  edd_real a = edd_real((_Float64x) 1.0) +
+      edd_real((_Float64x) __builtin_ldexpf64x((_Float64x) 1.0, -63));
+  edd_real s = sqrt(a);
+  edd_real back = sqr(s);
+
+  return edd_is_normalized(s) && edd_check_close(back, edd_to_qd(a), 8.0);
+}
+
+bool EddTestSuite::test7() {
+  cout << endl;
+  cout << "Test 7.  (edd parse / format round trips)." << endl;
+
+  const char *src = "-3.1415926535897932384626433832795028842e+40";
+  edd_real a(src);
+  std::string s = a.to_string(38, 0, std::ios_base::scientific);
+  edd_real b(s.c_str());
+  qd_real qsrc(src);
+
+  return edd_check_close(a, qsrc, 8.0) &&
+      edd_check_close(b, qsrc, 8.0);
+}
+
+bool EddTestSuite::test8() {
+  cout << endl;
+  cout << "Test 8.  (edd constructor / conversion checks)." << endl;
+
+  _Float64x x = (_Float64x) 1.0 +
+      __builtin_ldexpf64x((_Float64x) 1.0, -63);
+  edd_real a(x);
+  edd_real b(1.25);
+  edd_real c(7);
+
+  bool pass = (to_float64x(a) == x);
+  pass &= (to_double(b) == 1.25);
+  pass &= (to_int(c) == 7);
+  pass &= (a > (_Float64x) 1.0);
+
+  return pass;
+}
+
+bool EddTestSuite::test9() {
+  cout << endl;
+  cout << "Test 9.  (edd overflow / underflow boundary behavior)." << endl;
+
+  edd_real large = ldexp(edd_real((_Float64x) 1.0), QD_EDD_FLT64X_MAX_EXP - 200);
+  edd_real tiny = ldexp(edd_real((_Float64x) 1.0), -16000);
+  edd_real q = large / large;
+  edd_real p = large * tiny;
+  edd_real s = sqrt(sqr(ldexp(edd_real((_Float64x) 1.0), 4000)));
+
+  bool pass = (q == (_Float64x) 1.0);
+  pass &= p.isfinite();
+  pass &= (s == ldexp(edd_real((_Float64x) 1.0), 4000));
+
+  return pass;
+}
+
+bool EddTestSuite::testall() {
+  bool pass = true;
+  pass &= print_result(test1());
+  pass &= print_result(test2());
+  pass &= print_result(test3());
+  pass &= print_result(test4());
+  pass &= print_result(test5());
+  pass &= print_result(test6());
+  pass &= print_result(test7());
+  pass &= print_result(test8());
+  pass &= print_result(test9());
+  return pass;
+}
+
+bool test_edd_real_comparison() {
+  cout << endl;
+  cout << "Test 10.  (edd comparison normalization)." << endl;
+
+  _Float64x lo = __builtin_ldexpf64x((_Float64x) 1.0, -63);
+  edd_real a((_Float64x) 1.0 - lo, lo);
+  edd_real b((_Float64x) 1.0);
+  edd_real diff = a - b;
+
+  bool pass = diff.is_zero();
+  pass &= (a == b);
+  pass &= !(a != b);
+  pass &= !(a < b);
+  pass &= !(a > b);
+  pass &= (a <= b);
+  pass &= (a >= b);
+  pass &= (a == (_Float64x) 1.0);
+  pass &= ((_Float64x) 1.0 == a);
+
+  return pass;
+}
+
+#endif
 
 qd_real td_to_qd(const td_real &a) {
   return qd_real(a[0]) + qd_real(a[1]) + qd_real(a[2]);
@@ -1066,6 +1297,9 @@ void print_usage() {
   cout << "  -dd       Perform tests with double-double types." << endl;
   cout << "  -td       Perform tests with triple-double types." << endl;
   cout << "  -qd       Perform tests with quad-double types." << endl;
+#ifdef QD_HAVE_EDD_REAL
+  cout << "  -edd      Perform tests with extended-double-double types." << endl;
+#endif
   cout << "  -all      Perform double-double, triple-double, and quad-double tests." << endl;
   cout << "  -v" << endl;
   cout << "  -verbose  Print detailed information for each test." << endl;
@@ -1091,8 +1325,16 @@ int main(int argc, char *argv[]) {
       flag_test_td = true;
     } else if (strcmp(arg, "-qd") == 0) {
       flag_test_qd = true;
+#ifdef QD_HAVE_EDD_REAL
+    } else if (strcmp(arg, "-edd") == 0) {
+      flag_test_edd = true;
+#endif
     } else if (strcmp(arg, "-all") == 0) {
+#ifdef QD_HAVE_EDD_REAL
+      flag_test_dd = flag_test_td = flag_test_qd = flag_test_edd = true;
+#else
       flag_test_dd = flag_test_td = flag_test_qd = true;
+#endif
     } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "-verbose") == 0) {
       flag_verbose = true;
     } else {
@@ -1101,10 +1343,17 @@ int main(int argc, char *argv[]) {
   }
 
   /* If no flag, test both double-double and quad-double. */
-  if (!flag_test_dd && !flag_test_td && !flag_test_qd) {
+  if (!flag_test_dd && !flag_test_td && !flag_test_qd
+#ifdef QD_HAVE_EDD_REAL
+      && !flag_test_edd
+#endif
+      ) {
     flag_test_dd = true;
     flag_test_td = true;
     flag_test_qd = true;
+#ifdef QD_HAVE_EDD_REAL
+    flag_test_edd = true;
+#endif
   }
 
   if (flag_test_dd) {
@@ -1141,6 +1390,24 @@ int main(int argc, char *argv[]) {
     pass &= td_test.testall();
     pass &= print_result(test_td_real_comparison());
   }
+
+#ifdef QD_HAVE_EDD_REAL
+  if (flag_test_edd) {
+    EddTestSuite edd_test;
+
+    /* edd_real relies on native binary80 _Float64x limbs, so restore the
+       host x87 control word before running its tests.  The dd/qd/td tests
+       above intentionally use the round-to-double fix. */
+    fpu_fix_end(&old_cw);
+
+    cout << endl;
+    cout << "Testing edd_real ..." << endl;
+    if (flag_verbose)
+      cout << "sizeof(edd_real) = " << sizeof(edd_real) << endl;
+    pass &= edd_test.testall();
+    pass &= print_result(test_edd_real_comparison());
+  }
+#endif
 
   fpu_fix_end(&old_cw);
   return (pass ? 0 : 1);
