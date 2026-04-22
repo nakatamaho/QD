@@ -1,0 +1,914 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  language=C++,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries\color{blue!70!black},
+  commentstyle=\itshape\color{green!50!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  breaklines=true,
+  columns=flexible
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{remark}{Remark}
+
+\title{%
+  Extended-Double-Double Floating-Point Arithmetic: \\
+  A binary80-Based Two-Limb Expansion in the QD Library%
+}
+\author{%
+  Nakata Maho \\
+  \textit{RIKEN} \\
+  \texttt{maho@riken.jp}%
+}
+\date{2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe the design and algorithmic details of \texttt{edd\_real},
+an \emph{extended-double-double} floating-point type that
+complements the \texttt{dd\_real}, \texttt{td\_real}, and
+\texttt{qd\_real} families in the QD library by replacing the
+IEEE~754 binary64 limb with the GNU C++ binary80 type
+\texttt{\_Float64x}.  An \texttt{edd\_real} value is represented as
+an unevaluated sum of two non-overlapping binary80 numbers
+$a = x_0 + x_1$, yielding approximately 126-bit ($\approx 38$
+decimal digit) precision while retaining the native binary80
+dynamic range of $\approx 10^{\pm 4932}$.  Because the limb
+mantissa width is $p = 64$ rather than $53$, the Dekker splitter
+becomes $2^{32}+1$ and the multiplication, division, and square-root
+kernels must scale by $2^{\pm 33}$ (or larger) near the top of the
+exponent range to avoid overflow.  We give algorithms for splitting
+with rescaling, two-component renormalization, addition,
+subtraction, multiplication, overflow-safe division, Karp-style
+square root, and a hybrid transcendental strategy that delegates
+to \texttt{qd\_real} whenever the argument is within its safe range
+and falls back to native Taylor/Newton schemes otherwise.
+Interoperability with \texttt{dd\_real} and \texttt{qd\_real} is
+provided by explicit renormalizing truncations in both directions.
+The implementation is available as an optional component of the QD
+library, enabled at configure time on GNU C++ x86 targets.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Many applications in computational science require more than the
+$\approx 16$ decimal digits offered by IEEE~754 binary64
+(double-precision).  The QD library of Hida, Li, and
+Bailey~\cite{QD,HidaLiBailey2000} responds to this need by
+representing higher-precision values as unevaluated sums of
+binary64 limbs: two limbs for \texttt{dd\_real}
+($\approx 106$ bits, $\approx 32$ digits), four limbs for
+\texttt{qd\_real} ($\approx 212$ bits, $\approx 63$ digits), and
+three limbs for the intermediate \texttt{td\_real}
+($\approx 159$ bits, $\approx 47$ digits).  All three rely
+exclusively on binary64 arithmetic and error-free transformations
+(\textsc{TwoSum}, \textsc{TwoProd}) and are portable across every
+IEEE~754 platform.
+
+Several GNU C++ targets (notably x86 and x86\_64) additionally
+expose the IA-32 80-bit extended-precision format as the
+\texttt{\_Float64x} type.  This format carries a 64-bit explicit
+mantissa and an exponent range of $\pm 16\,383$, giving a single
+limb about 19 decimal digits of precision and a dynamic range of
+$\approx 10^{\pm 4\,932}$.  A two-limb expansion of
+\texttt{\_Float64x} therefore reaches about 126 bits, or
+$\approx 38$ decimal digits, occupying the gap between
+\texttt{dd\_real} (32 digits) and \texttt{td\_real} (47 digits)
+while simultaneously inheriting a far wider exponent range than
+any of the binary64-based types.  We call the resulting type
+\texttt{edd\_real} (\emph{extended double-double}).
+
+Why is \texttt{edd\_real} interesting?  From a pure-precision
+standpoint it delivers fewer decimal digits than
+\texttt{td\_real}, so for applications that are dominated by the
+length of the significand, \texttt{td\_real} remains preferable.
+The practical value of \texttt{edd\_real} lies elsewhere:
+
+\begin{itemize}
+  \item \textbf{Arithmetic cost.}  \texttt{edd\_real} stores only
+    two limbs, so its addition and multiplication cost follow the
+    well-known \texttt{dd\_real} formulas (2--3
+    \textsc{TwoSum}/\textsc{TwoProd} calls plus renormalization)
+    rather than the larger-arity kernels of \texttt{td\_real} and
+    \texttt{qd\_real}.  Each limb operation is a single binary80
+    FPU instruction on x86.
+  \item \textbf{Dynamic range.}  The binary80 base gives a
+    representable range up to approximately $2^{16383} \approx
+    10^{4\,932}$, versus $\approx 10^{308}$ for the binary64-based
+    types.  This matters for applications that must keep both
+    precision and very large or very small magnitudes, such as
+    AGM-based computations of transcendental constants.
+  \item \textbf{Drop-in interoperability.}  \texttt{edd\_real}
+    shares the QD library's conventions (operator overloading,
+    \texttt{sqrt}, \texttt{exp}, \texttt{log},~$\ldots$) and adds
+    explicit conversion routines to and from \texttt{dd\_real}
+    and \texttt{qd\_real}.
+\end{itemize}
+
+Naively porting \texttt{dd\_real} to binary80 is subtle.  Because
+the mantissa now has $p = 64$ bits, the Dekker splitter is
+$C = 2^{\lceil p/2 \rceil} + 1 = 2^{32} + 1$ rather than the
+familiar $2^{27}+1$ used by \texttt{dd\_real}.  The product $C \cdot a$
+can overflow when $|a|$ approaches the binary80 maximum, and the
+same phenomenon reappears in division (where $a_{\mathrm{hi}} / b$
+can overflow) and in square root (where $\mathrm{sqr}(s)$ can
+overflow for large $s$).  Each kernel therefore carries an explicit
+rescale-and-restore pattern, keyed to a different threshold.
+Section~\ref{sec:split} makes these thresholds precise.
+
+The remainder of the paper is organized as follows.
+Section~\ref{sec:prelim} recalls the binary80 format and the
+error-free transformations we rely on.
+Section~\ref{sec:repr} fixes the representation and the
+non-overlapping invariant.
+Section~\ref{sec:split} presents the splitter with rescaling.
+Sections~\ref{sec:renorm}--\ref{sec:sqrt} cover renormalization,
+addition, subtraction, multiplication, division, and square
+root.  Section~\ref{sec:trans} describes the hybrid transcendental
+strategy.  Section~\ref{sec:mixed} gives conversions and
+mixed-precision arithmetic.
+Sections~\ref{sec:const}--\ref{sec:test} describe constants,
+build-system detection, and the test suite.
+
+\section{Preliminaries}
+\label{sec:prelim}
+
+\subsection{The binary80 format}
+
+The Intel 80-bit extended-precision format, exposed by GNU~C++
+as \texttt{\_Float64x}, is the reference format for all
+\texttt{edd\_real} arithmetic.  Its parameters are:
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+Parameter & Value \\
+\midrule
+Explicit mantissa bits $p$ & $64$ \\
+Exponent bits & $15$ \\
+Bias & $16\,383$ \\
+$E_{\min},\ E_{\max}$ (macro) & $-16\,381,\ 16\,384$ \\
+Machine epsilon $\varepsilon_0 = 2^{-63}$ & $\approx 1.08\times 10^{-19}$ \\
+Decimal digits per limb & $\approx 19$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Following GNU C++ conventions, the \texttt{edd} backend refers to
+these parameters as the preprocessor macros
+\texttt{\_\_FLT64X\_MANT\_DIG\_\_ = 64} and
+\texttt{\_\_FLT64X\_MAX\_EXP\_\_ = 16384}, which are verified at
+\texttt{configure} time.  The builtins
+\verb|__builtin_sqrtf64x|, \verb|__builtin_ldexpf64x|,
+\verb|__builtin_fabsf64x|, \verb|__builtin_floorf64x|,
+\verb|__builtin_copysignf64x|, and \verb|__builtin_frexpf64x|
+are used throughout.  We introduce the abbreviation
+\verb|edd_word| for \texttt{\_Float64x}.
+
+\subsection{Error-free transformations}
+
+All \texttt{edd\_real} kernels are built from the following
+standard error-free transformations, reproduced here with the
+exact operation counts used by the implementation.
+
+\medskip
+
+\noindent\textsc{TwoSum}$(a,b)$: for IEEE-rounded addition,
+returns $(s, e)$ with $s = \mathrm{fl}(a+b)$ and $a+b = s+e$
+exactly, whenever $s$ is finite.  Cost: 6 flops.
+\begin{algorithmic}[1]
+\State $s \gets a + b$
+\State $b' \gets s - a$
+\State $e \gets (a - (s - b')) + (b - b')$
+\State \Return $(s, e)$
+\end{algorithmic}
+
+\noindent\textsc{QuickTwoSum}$(a,b)$: same guarantee when $|a| \ge
+|b|$.  Cost: 3 flops.
+\begin{algorithmic}[1]
+\State $s \gets a + b$;\quad $e \gets b - (s - a)$
+\State \Return $(s, e)$
+\end{algorithmic}
+
+\noindent\textsc{TwoDiff}$(a,b)$: analogous to \textsc{TwoSum} for
+subtraction.
+
+\medskip
+
+\noindent\textsc{TwoProd}$(a,b)$: returns $(p, e)$ with $p =
+\mathrm{fl}(ab)$ and $ab = p+e$ exactly.  On a target with a fused
+multiply--add this is a single multiplication and a single FMA.
+Without FMA, the Dekker--Veltkamp algorithm is used:
+\begin{algorithmic}[1]
+\State $p \gets a \cdot b$
+\State $(a_h, a_l) \gets \textsc{Split}(a)$;\quad $(b_h, b_l) \gets \textsc{Split}(b)$
+\State $e \gets ((a_h b_h - p) + a_h b_l + a_l b_h) + a_l b_l$
+\State \Return $(p, e)$
+\end{algorithmic}
+The splitter \textsc{Split}$(a) = (a_h, a_l)$ with $a = a_h + a_l$
+and $a_h$ having $\lfloor p/2 \rfloor$ trailing zeros is the
+source of the rescaling logic peculiar to \texttt{edd\_real}; we
+present it in Section~\ref{sec:split}.
+
+\textsc{TwoSqr}$(a)$ is the specialization of \textsc{TwoProd} to
+$b=a$ and requires only one \textsc{Split}.
+
+\section{Representation and Invariants}
+\label{sec:repr}
+
+An \texttt{edd\_real} stores a two-component array of binary80
+words:
+\begin{lstlisting}
+using edd_word = _Float64x;
+struct edd_real {
+  edd_word x[2];      // x[0] = hi, x[1] = lo
+  ...
+};
+\end{lstlisting}
+with the semantic value
+\[
+  a \;=\; a_0 + a_1, \qquad a_i := \texttt{x[$i$]}.
+\]
+A valid \texttt{edd\_real} is \emph{normalized}:
+\[
+  a_0 = \mathrm{fl}(a_0 + a_1), \qquad
+  |a_1| \;\le\; \tfrac{1}{2}\,\mathrm{ulp}_{80}(a_0),
+\]
+that is, the two limbs are non-overlapping in binary80.  We use
+the test
+\[
+  |a_1| \;\le\; \tfrac{1}{2} \cdot 2^{-63} \cdot |a_0|
+\]
+as an effective invariant check.  The constants \texttt{\_eps},
+\texttt{\_ndigits}, and the numeric limits specializations follow:
+\begin{lstlisting}
+const edd_word edd_real::_eps = ldexpx(1.0L, -126);
+const int edd_real::_ndigits = 38;
+namespace std {
+  template<> class numeric_limits<edd_real>
+      : public numeric_limits<long double> {
+    static const int digits   = 126;
+    static const int digits10 = 37;
+    ...
+  };
+}
+\end{lstlisting}
+The effective unit roundoff of \texttt{edd\_real} is therefore
+$\varepsilon = 2^{-126}$, and worst-case representability covers
+roughly 37 safely round-trippable decimal digits.
+
+\section{The Splitter with Rescaling}
+\label{sec:split}
+
+The Dekker--Veltkamp split requires a constant
+\[
+  C \;=\; 2^{\lceil p/2 \rceil} + 1 \;=\; 2^{32} + 1.
+\]
+The naive split,
+\[
+  t \gets C \cdot a, \quad
+  a_h \gets t - (t - a), \quad
+  a_l \gets a - a_h,
+\]
+is exact when $C \cdot a$ is representable.  For
+\texttt{edd\_real} this requires $|a| \lesssim 2^{E_{\max} - 33}$.
+A plain dd-style splitter therefore overflows near the top of the
+binary80 exponent range, and is especially problematic because
+\textsc{TwoProd} is called from high-precision transcendental
+functions that legitimately reach very large intermediate values.
+
+The implementation guards the naive split with a magnitude test
+and a temporary downscaling:
+
+\begin{lstlisting}
+inline void split(edd_word a, edd_word& hi, edd_word& lo) {
+  edd_word temp;
+  if (fabsx(a) > split_thresh()) {       // |a| > 2^(E_max - 33)
+    a   = ldexpx(a, -33);
+    temp = splitter() * a;
+    hi   = temp - (temp - a);
+    lo   = a - hi;
+    hi   = ldexpx(hi, 33);
+    lo   = ldexpx(lo, 33);
+  } else {
+    temp = splitter() * a;
+    hi   = temp - (temp - a);
+    lo   = a - hi;
+  }
+}
+\end{lstlisting}
+Here \texttt{splitter()} is $2^{32} + 1$ and
+\texttt{split\_thresh()} is $2^{E_{\max} - 33}$.  Exact
+\texttt{ldexpf64x} scaling by $\pm 33$ introduces no roundoff,
+so the rescaled split is mathematically identical to the
+unrescaled one; the guard exists only to keep the multiplication
+by $C$ finite.  The exponent $33$ is chosen as the smallest
+constant strictly greater than $\lceil p/2 \rceil = 32$, which is
+sufficient to absorb both the factor $C$ and the subsequent
+$t - a$.
+
+\begin{remark}
+The corresponding \texttt{dd\_real} splitter uses $C = 2^{27}+1$
+and a threshold of $2^{E_{\max}-28}$.  The constants differ only
+in the value of $\lceil p/2 \rceil$; the structure of the rescale
+is identical.  The QD-codebase terminology for the scaling
+exponent is \texttt{QD\_EDD\_SPLIT\_SCALE\_BITS}, defined as
+$33$.
+\end{remark}
+
+\section{Renormalization}
+\label{sec:renorm}
+
+Because \texttt{edd\_real} has only two limbs, renormalization
+reduces to a single \textsc{QuickTwoSum} call.  The
+implementation uses
+\begin{lstlisting}
+inline void renorm2(edd_word& c0, edd_word& c1) {
+  if (isinfx(c0)) return;
+  c0 = quick_two_sum(c0, c1, c1);
+}
+\end{lstlisting}
+which enforces $c_0 = \mathrm{fl}(c_0 + c_1)$ and leaves $c_1$ as
+the corresponding error term.  A 4-component variant
+\texttt{renorm4} is also provided: it is used when converting
+from \texttt{qd\_real} to \texttt{edd\_real}, where we first form
+a four-component sum by limb-wise truncation and then compress it
+to two normalized components (Section~\ref{sec:mixed}).
+
+\section{Addition}
+\label{sec:add}
+
+\subsection{\texttt{edd\_real $+$ edd\_word}}
+
+Adding a scalar $b$ to $a = (a_0, a_1)$:
+\begin{algorithmic}[1]
+\State $(s_1, s_2) \gets \textsc{TwoSum}(a_0, b)$
+\State $s_2 \gets s_2 + a_1$
+\State $(s_1, s_2) \gets \textsc{QuickTwoSum}(s_1, s_2)$
+\State \Return $(s_1, s_2)$
+\end{algorithmic}
+Cost: 1 \textsc{TwoSum} ($6$ flops) + 1 addition + 1
+\textsc{QuickTwoSum} ($3$ flops) $=10$ flops.
+
+\subsection{\texttt{edd\_real $+$ edd\_real}}
+
+We use the IEEE-style (``sloppy'') sum that the QD library adopts
+for \texttt{dd\_real}:
+\begin{algorithmic}[1]
+\State $(s_1, s_2) \gets \textsc{TwoSum}(a_0, b_0)$
+\State $(t_1, t_2) \gets \textsc{TwoSum}(a_1, b_1)$
+\State $s_2 \gets s_2 + t_1$
+\State $(s_1, s_2) \gets \textsc{QuickTwoSum}(s_1, s_2)$
+\State $s_2 \gets s_2 + t_2$
+\State $(s_1, s_2) \gets \textsc{QuickTwoSum}(s_1, s_2)$
+\State \Return $(s_1, s_2)$
+\end{algorithmic}
+Cost: 2 \textsc{TwoSum} + 2 \textsc{QuickTwoSum} $=18$ flops plus
+two scalar additions.  This is the same arithmetic pattern as the
+QD library's \texttt{sloppy\_add}.
+
+Subtraction \texttt{edd\_real $-$ edd\_real} uses the identical
+structure with \textsc{TwoDiff} in place of \textsc{TwoSum}.
+
+\section{Multiplication}
+\label{sec:mul}
+
+\subsection{\texttt{edd\_real $\times$ edd\_word}}
+
+\begin{algorithmic}[1]
+\State $(p_1, p_2) \gets \textsc{TwoProd}(a_0, b)$
+\State $p_2 \gets p_2 + a_1 b$
+\State $(p_1, p_2) \gets \textsc{QuickTwoSum}(p_1, p_2)$
+\State \Return $(p_1, p_2)$
+\end{algorithmic}
+Cost: 1 \textsc{TwoProd} + 1 mul-add + 1 \textsc{QuickTwoSum}.
+
+\subsection{\texttt{edd\_real $\times$ edd\_real}}
+
+\begin{algorithmic}[1]
+\State $(p_1, p_2) \gets \textsc{TwoProd}(a_0, b_0)$
+\State $p_2 \gets p_2 + a_0 b_1 + a_1 b_0$
+  \Comment{cross-terms; $a_1 b_1$ is beyond precision}
+\State $(p_1, p_2) \gets \textsc{QuickTwoSum}(p_1, p_2)$
+\State \Return $(p_1, p_2)$
+\end{algorithmic}
+Cost: 1 \textsc{TwoProd} + 2 multiplications + 2 additions + 1
+\textsc{QuickTwoSum}.
+
+The $a_1 b_1$ product is at most
+$\mathrm{ulp}_{80}(a_0) \cdot \mathrm{ulp}_{80}(b_0)$ in magnitude
+and therefore lies below the rounding threshold of $p_1$.  It is
+dropped, which is the source of the $\approx 2$-bit loss relative
+to the ideal $2p = 128$-bit product; the stored accuracy is
+$2p - 2 = 126$ bits, consistent with
+$\texttt{\_eps} = 2^{-126}$.
+
+\section{Division}
+\label{sec:div}
+
+Division uses the classical three-digit long-division scheme, with
+an additional rescaling pattern analogous to (but tuned
+differently from) the splitter.  The rescaling is necessary
+because the quotient $q_1 = a_0 / b$ can overflow when $|a_0|$
+approaches the binary80 maximum: dividing by a small $b$ amplifies
+the magnitude of $a_0$.  The threshold used is
+\[
+  T_{\mathrm{div}} \;=\; 2^{E_{\max} - \texttt{\_\_FLT64X\_MANT\_DIG\_\_}}
+  \;=\; 2^{16384 - 64} \;=\; 2^{16320},
+\]
+slightly below the overflow boundary by exactly one mantissa
+width.
+
+The implementation of \texttt{edd\_real / edd\_real} is
+
+\begin{lstlisting}
+inline edd_real operator/(const edd_real& a, const edd_real& b) {
+  const bool rescale = edd_real_div_needs_rescale(a.x[0]);
+  const edd_real aa  = rescale
+                     ? mul_pwr2(a, ldexpx(1.0L, -64))
+                     : a;
+  edd_word q1 = aa.x[0] / b.x[0];
+  edd_real r  = aa - q1 * b;
+  edd_word q2 = r.x[0] / b.x[0];
+  r          -= q2 * b;
+  edd_word q3 = r.x[0] / b.x[0];
+  q1 = quick_two_sum(q1, q2, q2);
+  r  = edd_real(q1, q2) + q3;
+  return rescale ? mul_pwr2(r, ldexpx(1.0L, 64)) : r;
+}
+\end{lstlisting}
+
+The structure mirrors the QD library's \texttt{sloppy\_div} for
+\texttt{dd\_real}: three trial quotients are accumulated, and the
+first two are combined by a \textsc{QuickTwoSum} before the final
+correction is added.  Because the rescale is by an exact power of
+two, it cancels when the rescale flag is true on entry and
+restored on exit.
+
+\section{Square Root}
+\label{sec:sqrt}
+
+The square root uses a single Karp-style refinement step
+\cite{Karp1997}.  Given $a > 0$, seed $x = 1/\sqrt{a_0}$ in
+binary80 and refine once:
+\[
+  s \;=\; a_0 x, \qquad
+  \sqrt{a} \;\approx\; s \;+\; (a - s^2)_0 \cdot (x/2).
+\]
+Reorganized in error-free form,
+\begin{lstlisting}
+inline edd_real sqrt_karp(const edd_real& a) {
+  edd_word x  = 1.0L / sqrtx(a[0]);
+  edd_word ax = a[0] * x;
+  return edd_real::add(
+      ax,
+      (a - edd_real::sqr(ax))[0] * (x * 0.5L));
+}
+\end{lstlisting}
+The outer call handles signs, zero, and an overflow guard:
+
+\begin{lstlisting}
+edd_real sqrt(const edd_real& a) {
+  if (a.is_zero())     return 0.0L;
+  if (a.is_negative()) { error(...); return _nan; }
+  if (fabsx(a[0]) > sqrt_rescale_thresh()) {
+    // |a[0]| > 2^(E_max - 3)
+    return mul_pwr2(sqrt_karp(mul_pwr2(a, 0.25L)), 2.0L);
+  }
+  return sqrt_karp(a);
+}
+\end{lstlisting}
+The threshold $2^{E_{\max} - 3}$ is necessary because the
+refinement step forms $s^2$: for $|a|$ near the binary80 maximum,
+the product $a_0 \cdot x$ is in the square-root regime
+$2^{E_{\max}/2}$ and $s^2$ would overflow if $x$ is not quite
+accurate.  Scaling $a$ down by $4$ (one extra bit of exponent
+margin on each side of the square root) avoids the issue, and the
+final result is scaled back by $2$.
+
+Convergence of one Karp step to full binary80 precision is
+quadratic, so the seed accuracy of $\approx 63$ bits from the
+native \texttt{sqrtf64x} is amplified to $\approx 126$ bits in a
+single refinement.  The hardware \texttt{sqrtf64x} is
+correctly-rounded on every supported platform, which is what
+makes a single-step refinement sufficient.
+
+\section{Transcendental Functions}
+\label{sec:trans}
+
+The transcendental implementations follow a \emph{hybrid} design.
+For each function, the code first tests whether the argument is
+safely within the \texttt{qd\_real} range:
+\begin{lstlisting}
+inline bool qd_safe_argument(const edd_real& a) {
+  return a.isfinite() && abs(a) <= to_edd_real(qd_real::_safe_max);
+}
+\end{lstlisting}
+If so, it converts $a$ to \texttt{qd\_real}, delegates to the
+high-quality \texttt{qd\_real} implementation, and converts back.
+This leverages QD's existing, well-tested range reduction and
+Taylor-series machinery without re-deriving it for binary80 limbs.
+For arguments outside the \texttt{qd\_real} safe range, a
+\texttt{edd\_real}-native scheme takes over.
+
+\subsection{\texttt{exp}}
+
+For any $a$, the native implementation uses the classical
+argument reduction
+\[
+  a \;=\; m \ln 2 + k \cdot r, \qquad
+  k = 2^{-12}, \quad |r| \le \tfrac{k}{2}\ln 2,
+\]
+and computes $\mathrm{expm1}(r)$ by Taylor series,
+then folds in $k$ by repeated squaring and in $m$ by
+\texttt{ldexp}:
+\begin{algorithmic}[1]
+\State $m \gets \lfloor a_0 / (\ln 2)_0 + 0.5 \rfloor$
+\State $r \gets (a - m \ln 2) / 4096$
+\State $s \gets \textsc{expm1Taylor}(r)$
+\For{$i = 1$ to $12$}
+  \State $s \gets 2s + s^2$ \Comment{$s$ represents $e^r - 1$}
+\EndFor
+\State \Return $\textsc{ldexp}(s + 1, m)$
+\end{algorithmic}
+Overflow and underflow are pre-tested against $a_0 \gtrless
+c \ln 2$ with $c = 16384$ for overflow and $c = -16445$ for
+underflow; these bounds come directly from the binary80 exponent
+range.
+
+\subsection{\texttt{log}}
+
+A Newton iteration of the equation $\exp(x) - a = 0$ converges
+cubically for correct seeds, so three iterations suffice from
+the binary80 \verb|__builtin_logf64x| seed:
+\begin{algorithmic}[1]
+\State $(m, e) \gets \texttt{frexpf64x}(a_0)$
+\State $x \gets \ln m + e \ln 2$
+\For{$i = 1$ to $3$}
+  \State $x \gets x + a \cdot e^{-x} - 1$
+\EndFor
+\State \Return $x$
+\end{algorithmic}
+The update $x \gets x + a e^{-x} - 1$ is derived from
+$f(x) = e^x - a$, $f'(x) = e^x$, so $x_{\mathrm{new}} = x -
+(e^x - a)/e^x = x + ae^{-x} - 1$.  The $\log_{10}$ function is
+implemented as $\log(a) / \log 10$.
+
+\subsection{\texttt{sincos}}
+
+For $|a| \le \texttt{qd\_real::\_safe\_max}$, the implementation
+converts to \texttt{qd\_real} and delegates.  For arguments
+outside this range, a native routine performs a two-stage
+reduction modulo $2\pi$ and $\pi/2$ followed by a single
+$\pi/16$-table lookup:
+
+\begin{algorithmic}[1]
+\State $z \gets \mathrm{nint}(a / 2\pi)$
+\State $r \gets a - 2\pi z$
+\State $q \gets \lfloor r_0 / (\pi/2)_0 + 0.5 \rfloor$
+\State $t \gets r - (\pi/2) q$,\ $j \gets q$
+\State $q \gets \lfloor t_0 / (\pi/16)_0 + 0.5 \rfloor$
+\State $t \gets t - (\pi/16) q$,\ $k \gets q$
+\State $(\sin t, \cos t) \gets \textsc{SinCosTaylor}(t)$
+\State combine with $\sin(k\pi/16)$, $\cos(k\pi/16)$ from table
+\State rotate by $j\pi/2$
+\end{algorithmic}
+The tables are held as pre-normalized \texttt{qd\_real} constants
+and converted to \texttt{edd\_real} on use.  Only four
+$k$-positions are needed ($k = 1,2,3,4$) because symmetry handles
+the remaining angles.  This matches the pattern used in the QD
+library's \texttt{sincos\_qd}, adapted to the two-limb expansion.
+
+\subsection{Inverse trigonometric and hyperbolic functions}
+
+The inverse trigonometric functions \texttt{asin}, \texttt{acos},
+and \texttt{atan} always delegate to \texttt{qd\_real} via
+conversion, because their arguments are bounded by $1$ and
+therefore always lie in the safe range.  The hyperbolic functions
+split on magnitude: for $|a| > 0.05$, \texttt{sinh} and
+\texttt{cosh} are implemented via $e^a \pm e^{-a}$ using the
+native \texttt{exp}; for $|a| \le 0.05$, a Taylor series avoids
+the catastrophic cancellation in $(e^a - e^{-a})/2$.
+\texttt{atan2} uses a Newton iteration driven by the binary80
+\verb|__builtin_atan2f64x| seed.
+
+\section{Type Conversion and Mixed-Precision Arithmetic}
+\label{sec:mixed}
+
+Interoperability with \texttt{dd\_real} and \texttt{qd\_real} is
+essential because the transcendental fallback depends on it.
+
+\subsection{\texttt{dd\_real} $\leftrightarrow$ \texttt{edd\_real}}
+
+\texttt{dd\_real} has two binary64 limbs whose combined precision
+($\approx 106$ bits) is narrower than a single binary80 word.
+The forward conversion is therefore exact, given a renormalization:
+\begin{lstlisting}
+edd_real::edd_real(const dd_real& dd) {
+  x[0] = (edd_word) dd._hi();
+  x[1] = (edd_word) dd._lo();
+  renorm2(x[0], x[1]);
+}
+\end{lstlisting}
+The reverse direction is lossy: a single binary80 word already
+carries more bits than two binary64 words combined, so we
+decompose each limb into a head/tail pair and ship the top four
+fragments to \texttt{qd\_real} before taking its two high
+components.
+
+\subsection{\texttt{qd\_real} $\leftrightarrow$ \texttt{edd\_real}}
+
+For the forward direction \texttt{qd\_real $\to$ edd\_real}, we
+truncate from four binary64 limbs to two binary80 limbs:
+\begin{lstlisting}
+inline edd_real from_qd_truncate(const qd_real& a) {
+  edd_word c0 = (edd_word) a[0], c1 = (edd_word) a[1];
+  edd_word c2 = (edd_word) a[2], c3 = (edd_word) a[3];
+  renorm4(c0, c1, c2, c3);
+  return edd_real(c0, c1);
+}
+\end{lstlisting}
+The \texttt{renorm4} cascade compresses the four limbs into two
+non-overlapping components while discarding bits that fall below
+the binary80 rounding threshold.
+
+For the reverse direction \texttt{edd\_real $\to$ qd\_real}, the
+routine splits each \texttt{edd\_word} into a binary64 head and a
+binary64 tail by conversion arithmetic:
+\begin{lstlisting}
+inline void word_to_doubles(edd_word x, double& hi, double& lo) {
+  hi = static_cast<double>(x);
+  lo = static_cast<double>(x - (edd_word) hi);
+}
+\end{lstlisting}
+The resulting four binary64 numbers are handed to
+\texttt{qd\_real::renorm}.  Because binary80 rounding of the
+subtraction \texttt{x - (edd\_word) hi} is exact (the head has at
+most 53 significant bits, so the tail fits within one binary80
+mantissa), the decomposition is error-free.
+
+\subsection{Mixed-precision operators}
+
+All arithmetic operators accept a mixed \texttt{edd\_word}/%
+\texttt{edd\_real} pair and forward to the appropriate kernel.
+Comparison operators are implemented via
+\begin{lstlisting}
+inline bool comparison_lt(const A& a, const B& b) {
+  edd_real ea(a), eb(b);
+  if (ea.isnan() || eb.isnan()) return false;
+  if (ea.isinf() || eb.isinf()) return ea[0] <  eb[0];
+  return (ea - eb).is_negative();
+}
+\end{lstlisting}
+This promotes \texttt{edd\_word} operands to \texttt{edd\_real}
+and delegates to the sign test of the difference.  Bit-level
+equality (including the $(1 - 2^{-63}, 2^{-63})$ pair with
+$(1, 0)$) is correctly recognized as equal by this scheme because
+\texttt{renorm2} collapses the difference to an exact zero.
+
+\section{Constants}
+\label{sec:const}
+
+Elementary \texttt{edd\_real} constants are \emph{not} recomputed
+at runtime.  Instead, the well-established \texttt{qd\_real}
+reference values are truncated through \texttt{renorm4}:
+\begin{lstlisting}
+const edd_real edd_real::_pi    = to_edd_real(qd_real::_pi);
+const edd_real edd_real::_2pi   = to_edd_real(qd_real::_2pi);
+const edd_real edd_real::_pi2   = to_edd_real(qd_real::_pi2);
+const edd_real edd_real::_pi4   = to_edd_real(qd_real::_pi4);
+const edd_real edd_real::_3pi4  = to_edd_real(qd_real::_3pi4);
+const edd_real edd_real::_e     = to_edd_real(qd_real::_e);
+const edd_real edd_real::_log2  = to_edd_real(qd_real::_log2);
+const edd_real edd_real::_log10 = to_edd_real(qd_real::_log10);
+\end{lstlisting}
+The \texttt{qd\_real} constants carry more than 200 bits of
+accuracy, comfortably exceeding the 126 bits of
+\texttt{edd\_real}; truncation therefore loses no
+representable bits.  Independent computation of these constants
+(e.g.\ by AGM as in the example \texttt{examples/edd\_agm.cpp})
+agrees with the truncated values to within a small multiple of
+\texttt{edd\_real::\_eps}.
+
+Special values are generated directly from binary80 primitives:
+\texttt{\_nan} via \verb|__builtin_nanf64x("")|, \texttt{\_inf}
+via \verb|__builtin_huge_valf64x()|.
+
+\section{Build-System Detection}
+\label{sec:build}
+
+\texttt{edd\_real} is an optional component of the QD library; it
+is compiled only when the host compiler advertises binary80
+\texttt{\_Float64x} support.  The \texttt{configure.ac} probe
+compiles a small program that asserts
+\begin{itemize}
+  \item \verb|__GNUC__| is defined,
+  \item the target is x86 or x86\_64,
+  \item \verb|__FLT64X_MANT_DIG__ == 64|,
+  \item \verb|__FLT64X_MAX_EXP__ == 16384|, and
+  \item the relevant \texttt{\_Float64x} builtins link successfully.
+\end{itemize}
+On success, the probe defines
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Macro & Value \\
+\midrule
+\texttt{QD\_HAVE\_EDD\_REAL}          & $1$ \\
+\texttt{QD\_EDD\_FLT64X\_MANT\_DIG}   & $64$ \\
+\texttt{QD\_EDD\_FLT64X\_MAX\_EXP}    & $16384$ \\
+\texttt{QD\_EDD\_SPLIT\_BITS}         & $32$ \\
+\texttt{QD\_EDD\_SPLIT\_SCALE\_BITS}  & $33$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+and the Automake conditional \texttt{HAVE\_EDD\_REAL} becomes
+true.  The Makefile then adds \texttt{edd\_real.cpp},
+\texttt{edd\_const.cpp}, \texttt{edd\_trans.cpp}, and
+\texttt{c\_edd.cpp} to \texttt{libqd}.  A summary line
+\texttt{edd\_real = enabled/disabled} is printed at the end of
+\texttt{configure}.
+
+On non-GNU compilers or on non-x86 targets the probe fails
+silently, the macro \texttt{QD\_HAVE\_EDD\_REAL} remains
+undefined, and the binary64-based \texttt{dd\_real},
+\texttt{td\_real}, and \texttt{qd\_real} types continue to be
+built as usual.  A header guard in \texttt{edd\_real.h} converts
+any accidental inclusion into a compile-time error.
+
+\section{C Bindings and the Test Suite}
+\label{sec:test}
+
+\subsection{C wrapper}
+
+A thin C interface is provided by \texttt{include/qd/c\_edd.h}.
+The wrapper functions take \texttt{const \_Float64x *} input and
+\texttt{\_Float64x *} output and internally reinterpret them as
+\texttt{edd\_real} values.  All of the arithmetic, comparison,
+transcendental, and string-I/O operators are exposed, together
+with the constants \texttt{c\_edd\_pi}, \texttt{c\_edd\_2pi}, and
+\texttt{c\_edd\_epsilon}.  The smoke test in \texttt{tests/c\_test.c}
+verifies $\sin^2 x + \cos^2 x = 1$, $\log(\exp x) = x$, and
+$|\tanh x| < 1$ through the C interface.
+
+\subsection{C++ test suite}
+
+The C++ test suite \texttt{tests/qd\_test.cpp} adds an
+\texttt{-edd} mode alongside the existing
+\texttt{-dd}/\texttt{-td}/\texttt{-qd} switches.  The
+\texttt{EddTestSuite} class contains 18 numbered tests covering:
+
+\begin{center}
+\begin{tabular}{rl}
+\toprule
+\# & Purpose \\
+\midrule
+1  & Normalization after $+$, $-$, $\times$, $/$, $\sqrt{\,}$ \\
+2  & Cancellation-sensitive $a-b$ and round-trip \\
+3  & Mixed-magnitude multiplication vs.\ \texttt{qd\_real} \\
+4  & Basic division, $1/3$, inverse check \\
+5  & $\sqrt{}$ on exact squares \\
+6  & $\sqrt{}$ near $1$ \\
+7  & String parse / format round trip \\
+8  & Constructor / scalar conversion \\
+9  & Constants \\
+10 & String I/O with \texttt{inf}, \texttt{nan}, signed zero \\
+11 & Mixed-mode \texttt{edd\_word} arithmetic \\
+12 & \texttt{dd}/\texttt{qd} conversion paths \\
+13 & Overflow / underflow boundaries \\
+14 & \texttt{exp}/\texttt{log} across safe and wide ranges \\
+15 & Trig identities, agreement with \texttt{qd\_real} oracle \\
+16 & Inverse-trig consistency \\
+17 & Large-argument reduction, hyperbolic identities \\
+18 & Comparison normalization for overlapping inputs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Tolerances are expressed as small multiples of
+\texttt{edd\_real::\_eps}, with the \texttt{qd\_real} value as
+reference oracle.  The test binary also exercises a stress case
+in which $\sin(a)$ and $\cos(a)$ must agree with the
+\texttt{qd\_real} result at $a = 10^{40}\pi + 0.125$; the native
+range-reduction path is active for this argument.
+
+Before running the \texttt{edd\_real} tests, the test harness
+calls \texttt{fpu\_fix\_end} to release the x87 round-to-double
+control word that the \texttt{dd}/\texttt{qd}/\texttt{td} tests
+install.  This is critical: \texttt{edd\_real} needs the x87 FPU
+in 80-bit mode, whereas \texttt{dd\_real} requires the 53-bit
+round-to-double mode for its error-free transformations to be
+provably exact.
+
+\subsection{AGM example}
+
+The file \texttt{examples/edd\_agm.cpp} computes $\pi$, $\log 2$,
+$\log 10$, $\log_{10} 2$, and $\log_{10} e$ from scratch by the
+Brent--Salamin AGM iteration and the Brent--McMillan
+logarithm-via-AGM formula.  The program compares the AGM results
+to the \texttt{edd\_real} built-in constants and reports the
+errors in units of \texttt{edd\_real::\_eps}.  With $8$ AGM
+iterations and a scaling shift of $80$, all five constants agree
+with their references to within a few times \texttt{\_eps}, i.e.\
+within a few ulps of full \texttt{edd\_real} precision.
+
+\section{Discussion and Conclusion}
+\label{sec:conclusion}
+
+We have described \texttt{edd\_real}, a two-limb extended-double-%
+double floating-point type based on the GNU C++ \texttt{\_Float64x}
+binary80 format.  Its unit roundoff $2^{-126}$ corresponds to
+$\approx 38$ decimal digits, placing it between \texttt{dd\_real}
+and \texttt{td\_real} in precision but exceeding both in dynamic
+range.  The two-limb structure keeps the per-operation cost close
+to \texttt{dd\_real}, while the hybrid transcendental strategy
+lets the implementation reuse \texttt{qd\_real}'s extensively
+tested range reduction whenever the argument is small enough.
+
+The distinguishing technical features of the implementation are
+(a) the splitter rescaling at $2^{-33}$, derived from
+$\lceil p/2 \rceil + 1 = 33$ for binary80; (b) a division
+rescaling at the threshold $2^{E_{\max}-64}$ keyed to the full
+mantissa width; and (c) a square-root rescaling at the threshold
+$2^{E_{\max}-3}$ keyed to the squaring step inside Karp's
+refinement.  These three thresholds are all exactly-representable
+powers of two, so the rescale/restore steps are arithmetically
+invisible; they exist solely to keep intermediate products finite
+near the top of the binary80 exponent range.
+
+\texttt{edd\_real} is Phase~1 complete: it is correct, well-tested,
+and interoperates cleanly with the rest of the QD library, but its
+transcendental implementations largely delegate to
+\texttt{qd\_real} for small arguments.  A Phase~2 effort could
+develop fully native \texttt{edd\_real} implementations of the
+range-reduction machinery, avoiding the round-trip through
+\texttt{qd\_real}; this would unlock the full binary80 dynamic
+range for sine, cosine, and arctangent at near-full
+\texttt{edd\_real} precision, and is a natural continuation of the
+work described here.
+
+\begin{thebibliography}{9}
+
+\bibitem{QD}
+Y.~Hida, X.~S.~Li, and D.~H.~Bailey.
+\emph{Library for Double-Double and Quad-Double Arithmetic}.
+Lawrence Berkeley National Laboratory, 2000--2023.
+\url{https://github.com/BL-highprecision/QD}.
+
+\bibitem{HidaLiBailey2000}
+Y.~Hida, X.~S.~Li, and D.~H.~Bailey.
+Algorithms for quad-double precision floating-point arithmetic.
+In \emph{Proc.\ 15th IEEE Symposium on Computer Arithmetic},
+pp.\ 155--162, 2001.
+
+\bibitem{Dekker1971}
+T.~J.~Dekker.
+A floating-point technique for extending the available precision.
+\emph{Numerische Mathematik}, 18(3):224--242, 1971.
+
+\bibitem{Knuth1997}
+D.~E.~Knuth.
+\emph{The Art of Computer Programming, Volume 2: Seminumerical
+Algorithms}, 3rd ed.
+Addison-Wesley, 1997.
+
+\bibitem{Karp1997}
+A.~H.~Karp and P.~Markstein.
+High-precision division and square root.
+\emph{ACM Trans.\ Math.\ Softw.}, 23(4):561--589, 1997.
+
+\bibitem{Intel80}
+Intel Corporation.
+\emph{Intel 64 and IA-32 Architectures Software Developer's
+Manual, Vol.\ 1: Basic Architecture}.  Chapter on the x87 FPU.
+
+\bibitem{BrentSalamin}
+R.~P.~Brent.
+Multiple-precision zero-finding methods and the complexity of
+elementary function evaluation.
+In \emph{Analytic Computational Complexity}, pp.\ 151--176,
+Academic Press, 1975.
+
+\end{thebibliography}
+
+\end{document}
