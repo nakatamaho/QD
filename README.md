@@ -12,6 +12,12 @@ Fortran:
 - `qd_real`: quad-double precision, about 212 mantissa bits
 
 ## News
+2026-04-22 libQD3 1.1.0 was released.  This release adds
+binary80-based `edd_real` extended-double support, including core
+arithmetic, constants, conversions, transcendental functions, a small C API,
+documentation, and AGM examples.  See
+[CHANGES.1.1.0.md](CHANGES.1.1.0.md) for the 1.1.0 release notes.
+
 2026-04-20 libQD3 1.0.0 was released.  This first release adds
 TD/triple-double support through the new `td_real` type.  See
 [CHANGES.1.0.0.md](CHANGES.1.0.0.md) for the 1.0.0 release notes.
@@ -35,8 +41,8 @@ $ make -C docs td.pdf
 
 after installing the necessary LaTeX bits on your system.
 
-Release-specific notes for libQD3 1.0.0 are in
-[CHANGES.1.0.0.md](CHANGES.1.0.0.md).
+Release-specific notes for libQD3 1.1.0 are in
+[CHANGES.1.1.0.md](CHANGES.1.1.0.md).
 
 ## Tips for developers
 
