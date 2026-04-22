@@ -2,12 +2,14 @@
 
 libQD3 is a fork of the [QD library](https://github.com/BL-highprecision/QD).
 It keeps the original double-double and quad-double functionality and adds
-native triple-double support.
+native extended-double and triple-double support.
 
 libQD3 provides extended-precision floating-point types for C++, C, and
 Fortran:
 
 - `dd_real`: double-double precision, about 106 mantissa bits
+- `edd_real`: extended-double precision based on two binary80 `_Float64x`
+  limbs
 - `td_real`: triple-double precision, about 159 mantissa bits
 - `qd_real`: quad-double precision, about 212 mantissa bits
 
@@ -36,6 +38,7 @@ To build the PDFs from LaTeX sources, run
 
 ```
 $ make -C docs qd.pdf
+$ make -C docs edd.pdf
 $ make -C docs td.pdf
 ```
 
@@ -90,7 +93,7 @@ PASS: c_test
 PASS: huge
 PASS: f_test
 ============================================================================
-Testsuite summary for qd3 1.0.0
+Testsuite summary for qd3 1.1.0
 ============================================================================
 # TOTAL: 5
 # PASS:  5
@@ -108,6 +111,7 @@ numeric test can also be run by precision:
 
 ```
 $ ./tests/qd_test -dd
+$ ./tests/qd_test -edd
 $ ./tests/qd_test -td
 $ ./tests/qd_test -qd
 ```
