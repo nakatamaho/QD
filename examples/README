@@ -2,3 +2,7 @@ After `make` in the repository root, build the example with:
   g++ -Iinclude -Lsrc/.libs -Wl,-rpath,src/.libs -o examples/edd_agm examples/edd_agm.cpp -lqd -lm
 Run it with:
   ./examples/edd_agm
+
+Another example computes `H_n - log(n)` and an Euler-Maclaurin-corrected
+estimate of Euler's constant with:
+  g++ -Iinclude -Lsrc/.libs -Wl,-rpath,src/.libs -o examples/edd_euler_gamma examples/edd_euler_gamma.cpp -lqd -lm
